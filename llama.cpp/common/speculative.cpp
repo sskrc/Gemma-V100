@@ -573,12 +573,20 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         batch     = common_batch(ctx_dft);
         batch_enc = common_batch(ctx_dft);
 
+        const bool pure_greedy_dft = !this->params.probabilistic && this->params.p_min <= 0.0f;
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            if (pure_greedy_dft) {
+                sparams.top_k    = 1;
+                sparams.temp     = 0.0f;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+            } else {
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            }
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -587,7 +595,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                if (pure_greedy_dft) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+                } else {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                }
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1860,12 +1872,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         batch = common_batch(ctx_dft);
 
+        const bool pure_greedy_dft = !this->params.probabilistic && this->params.p_min <= 0.0f;
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            if (pure_greedy_dft) {
+                sparams.top_k    = 1;
+                sparams.temp     = 0.0f;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+            } else {
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            }
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -1874,7 +1894,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                if (pure_greedy_dft) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+                } else {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                }
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -2189,39 +2213,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 auto * smpl = smpls[seq_id].get();
-
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                llama_token id;
+                if (!params.probabilistic && params.p_min <= 0.0f && backend_chains[seq_id] != nullptr) {
+                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
+                } else {
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+
+                    // only collect very high-confidence draft tokens
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
+
+                    if (dparams.at(seq_id).result_q) {
+                        dparams.at(seq_id).result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
-
-                // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
-
-                common_sampler_accept(smpl, id, true);
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
-
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;

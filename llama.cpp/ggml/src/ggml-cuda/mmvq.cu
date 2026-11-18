@@ -1156,7 +1156,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_Q3_K,
         };
 
-        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
+        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
         if (is_nvidia_turing_plus) {
@@ -1449,6 +1449,20 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+static thread_local const ggml_tensor * g_mmvq_q8_1_src1        = nullptr;
+static thread_local bool                g_mmvq_q8_1_allow_reuse = false;
+static thread_local const char *        g_mmvq_q8_1_last_ptr    = nullptr;
+static thread_local size_t              g_mmvq_q8_1_last_size   = 0;
+
+void ggml_cuda_mmvq_set_q8_1_cache(const ggml_tensor * src1, bool allow_reuse) {
+    if (!allow_reuse || src1 != g_mmvq_q8_1_src1) {
+        g_mmvq_q8_1_last_ptr  = nullptr;
+        g_mmvq_q8_1_last_size = 0;
+    }
+    g_mmvq_q8_1_src1        = src1;
+    g_mmvq_q8_1_allow_reuse = allow_reuse;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1546,12 +1560,20 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), q8_1_size);
+    if (g_mmvq_q8_1_allow_reuse && src1 == g_mmvq_q8_1_src1 &&
+        src1_q8_1.get() == g_mmvq_q8_1_last_ptr && q8_1_size == g_mmvq_q8_1_last_size) {
+        // Reuse already-quantized src1_q8_1 from immediately preceding MUL_MAT
+    } else {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (src1 == g_mmvq_q8_1_src1) {
+            g_mmvq_q8_1_last_ptr  = src1_q8_1.get();
+            g_mmvq_q8_1_last_size = q8_1_size;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

@@ -243,6 +243,8 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
         // this is to mirror Gemma4Attention in pytorch code
         ggml_tensor * qkv_fused = nullptr;
         ggml_tensor * Qcur;
+        ggml_tensor * Kcur = nullptr;
+        ggml_tensor * Vcur = nullptr;
         if (model.layers[il].wqkv) {
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
@@ -250,6 +252,17 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_rows, qkv_fused->nb[1], 0));
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            if (hparams.has_kv(il)) {
+                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+                Vcur = model.layers[il].wv
+                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+                       : Kcur;
+                ggml_build_forward_expand(gf, Qcur);
+                ggml_build_forward_expand(gf, Kcur);
+                if (Vcur != Kcur) {
+                    ggml_build_forward_expand(gf, Vcur);
+                }
+            }
         }
         {
             cb(Qcur, "Qcur", il);
@@ -265,8 +278,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
 
         // self-attention
         if (hparams.has_kv(il)) {
-            ggml_tensor * Kcur;
-            ggml_tensor * Vcur;
             if (qkv_fused) {
                 const int64_t q_dim = n_embd_head * n_head;
                 const int64_t k_dim = n_embd_head * n_head_kv;
@@ -274,11 +285,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                 const size_t  esize = ggml_element_size(qkv_fused);
                 Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
                 Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
-            } else {
-                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-                Vcur = model.layers[il].wv
-                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
-                       : Kcur; // if v_proj is not present, use Kcur as Vcur
             }
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
@@ -402,7 +408,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
             cb(cur, "pe_in", il);
 
             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_rows]
-            cur = ggml_gelu(ctx0, cur);
 
             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
@@ -410,7 +415,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
-            cur = ggml_mul(ctx0, cur, inp_this_layer);
+            cur = ggml_geglu_split(ctx0, cur, inp_this_layer);
             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_rows]
             cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "per_layer_embd_out", il);

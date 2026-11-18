@@ -4156,13 +4156,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
-        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
-        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
-        const ggml_tensor *add      = nullptr;
+    if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor *rms_norm  = cgraph->nodes[node_idx];
+        const ggml_tensor *mul       = cgraph->nodes[node_idx+1];
+        const ggml_tensor *add       = nullptr;
+        const ggml_tensor *scale_mul = nullptr;
 
-        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
+        if (ops.size() >= 3 && ops.begin()[2] == GGML_OP_ADD) {
             add = cgraph->nodes[node_idx+2];
+        }
+        if (ops.size() == 4 && ops.begin()[3] == GGML_OP_MUL) {
+            scale_mul = cgraph->nodes[node_idx+3];
         }
 
         // the mul operand is a norm weight, which model files store as F32;
@@ -4180,6 +4184,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (add) {
             const ggml_tensor * add_src = add->src[0] == mul ? add->src[1] : add->src[0];
             if ((add_src->type != GGML_TYPE_F32 && add_src->type != type) || add->type != type) {
+                return false;
+            }
+        }
+
+        if (scale_mul) {
+            if (!add || (scale_mul->src[0] != add && scale_mul->src[1] != add) || scale_mul->type != type || !ggml_are_same_shape(scale_mul, add)) {
+                return false;
+            }
+            const ggml_tensor * scale_src = scale_mul->src[0] == add ? scale_mul->src[1] : scale_mul->src[0];
+            if (scale_src->type != GGML_TYPE_F32 || ggml_nelements(scale_src) != 1 || !ggml_is_contiguous(scale_src)) {
                 return false;
             }
         }
@@ -4256,7 +4270,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL
-     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_GELU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
         const ggml_tensor * unary = cgraph->nodes[node_idx];
         const ggml_tensor * mul   = cgraph->nodes[node_idx+1];
 
@@ -5123,6 +5137,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5149,6 +5168,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_GELU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
@@ -5278,12 +5298,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            const ggml_tensor * prev_mm_src1 = nullptr;
+            ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                    prev_mm_src1 = nullptr;
+                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                     chunk_end = i + chunk_size;
@@ -5329,9 +5354,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (!is_concurrent_event_active && node->op == GGML_OP_MUL_MAT) {
+                    ggml_cuda_mmvq_set_q8_1_cache(node->src[1], node->src[1] == prev_mm_src1);
+                    prev_mm_src1 = node->src[1];
+                } else {
+                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
+                    prev_mm_src1 = nullptr;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    prev_mm_src1 = nullptr;
+                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5558,7 +5593,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_tensor * gate = glu->src[0];
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
+                if (ok && (ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device) ||
+                           ggml_cuda_should_fuse_mul_mat(up, gate, glu))) {
                     add_alloc_deps(i, i + 2);
                     i += 2;
                     continue;

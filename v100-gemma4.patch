@@ -1,0 +1,683 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 564fa9c..39a9314 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -345,6 +345,10 @@ struct common_sampler * common_sampler_init(
+ 
+         bool use_adaptive_p = false; // see below
+ 
++        const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
++            ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp <= 0.0f && params.dynatemp_range <= 0.0f) ||
++             (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
++
+         for (const auto & cnstr : params.samplers) {
+             switch (cnstr) {
+                 case COMMON_SAMPLER_TYPE_DRY:
+@@ -358,25 +362,37 @@ struct common_sampler * common_sampler_init(
+                     }
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_K:
+-                    samplers.push_back(llama_sampler_init_top_k(params.top_k));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_top_k(params.top_k));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_P:
+-                    samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+-                    samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_MIN_P:
+-                    samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_XTC:
+                     samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
+                     break;
+                 case COMMON_SAMPLER_TYPE_TYPICAL_P:
+-                    samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
+-                    samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
++                    if (!greedy) {
++                        samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
++                    }
+                     break;
+                 case COMMON_SAMPLER_TYPE_INFILL:
+                     samplers.push_back(llama_sampler_init_infill(vocab));
+@@ -399,10 +415,6 @@ struct common_sampler * common_sampler_init(
+             // only if user explicitly included adaptive-p sampler
+             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+         } else {
+-            // Keep distribution sampling when callers request probabilities.
+-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+-                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+-                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+             samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+         }
+     } else if (params.mirostat == 1) {
+@@ -616,10 +628,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
+-
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
++    if (gsmpl->params.n_probs == 0) {
++        id = llama_get_sampled_token_ith(ctx, idx);
++
++        if (id != LLAMA_TOKEN_NULL) {
++            LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
++
++            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
++            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
++
++            gsmpl->cur.assign(1, llama_token_data{ id, 0.0f, 1.0f });
++            gsmpl->cur_p = { gsmpl->cur.data(), 1, 0, true };
++
++            return id;
++        }
++    }
++
++    gsmpl->set_logits(ctx, idx);
++
+     {
+         id = llama_get_sampled_token_ith(ctx, idx);
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b40eb55..93feb3a 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -573,12 +573,20 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+         batch     = common_batch(ctx_dft);
+         batch_enc = common_batch(ctx_dft);
+ 
++        const bool pure_greedy_dft = !this->params.probabilistic && this->params.p_min <= 0.0f;
++
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+             sparams.no_perf  = false;
+-            sparams.top_k    = 10;
+-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
++            if (pure_greedy_dft) {
++                sparams.top_k    = 1;
++                sparams.temp     = 0.0f;
++                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
++            } else {
++                sparams.top_k    = 10;
++                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
++            }
+             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+         }
+ 
+@@ -587,7 +595,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+         if (this->params.backend_sampling) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                if (pure_greedy_dft) {
++                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
++                } else {
++                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                }
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -1860,12 +1872,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         batch = common_batch(ctx_dft);
+ 
++        const bool pure_greedy_dft = !this->params.probabilistic && this->params.p_min <= 0.0f;
++
+         smpls.resize(n_seq);
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+             sparams.no_perf  = false;
+-            sparams.top_k    = 10;
+-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
++            if (pure_greedy_dft) {
++                sparams.top_k    = 1;
++                sparams.temp     = 0.0f;
++                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
++            } else {
++                sparams.top_k    = 10;
++                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
++            }
+             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+         }
+ 
+@@ -1874,7 +1894,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (this->params.backend_sampling) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                if (pure_greedy_dft) {
++                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
++                } else {
++                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                }
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -2189,40 +2213,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 auto * smpl = smpls[seq_id].get();
+-
+-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                llama_token id;
++                if (!params.probabilistic && params.p_min <= 0.0f && backend_chains[seq_id] != nullptr) {
++                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
++                } else {
++                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
++                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
++                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
++                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
++                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
++                    }
+ 
+-                // add drafted token for each sequence
+-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
++                    // add drafted token for each sequence
++                    id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+ 
+-                // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
++                    // only collect very high-confidence draft tokens
++                    if (cur_p->data[0].p < params.p_min) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
+ 
+-                    continue;
+-                }
++                        continue;
++                    }
+ 
+-                common_sampler_accept(smpl, id, true);
++                    common_sampler_accept(smpl, id, true);
++
++                    if (dparams.at(seq_id).result_q) {
++                        dparams.at(seq_id).result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
++                    }
++                }
+ 
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+                 result.push_back(id);
+ 
+-                if (dp.result_q) {
+-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+-                }
+-
+                 if (params.n_max <= (int) result.size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 540c536..dbe438f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4156,14 +4156,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return false;
+     }
+ 
+-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+-        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+-        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+-        const ggml_tensor *add      = nullptr;
++    if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
++        const ggml_tensor *rms_norm  = cgraph->nodes[node_idx];
++        const ggml_tensor *mul       = cgraph->nodes[node_idx+1];
++        const ggml_tensor *add       = nullptr;
++        const ggml_tensor *scale_mul = nullptr;
+ 
+-        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
++        if (ops.size() >= 3 && ops.begin()[2] == GGML_OP_ADD) {
+             add = cgraph->nodes[node_idx+2];
+         }
++        if (ops.size() == 4 && ops.begin()[3] == GGML_OP_MUL) {
++            scale_mul = cgraph->nodes[node_idx+3];
++        }
+ 
+         // the mul operand is a norm weight, which model files store as F32;
+         // the add operand is an F32 bias or a residual with the type of x
+@@ -4184,6 +4188,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+             }
+         }
+ 
++        if (scale_mul) {
++            if (!add || (scale_mul->src[0] != add && scale_mul->src[1] != add) || scale_mul->type != type || !ggml_are_same_shape(scale_mul, add)) {
++                return false;
++            }
++            const ggml_tensor * scale_src = scale_mul->src[0] == add ? scale_mul->src[1] : scale_mul->src[0];
++            if (scale_src->type != GGML_TYPE_F32 || ggml_nelements(scale_src) != 1 || !ggml_is_contiguous(scale_src)) {
++                return false;
++            }
++        }
++
+         //if rms norm is the B operand, then we don't handle broadcast
+         if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+             return false;
+@@ -4256,7 +4270,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     }
+ 
+     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL
+-     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
++     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_GELU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+         const ggml_tensor * unary = cgraph->nodes[node_idx];
+         const ggml_tensor * mul   = cgraph->nodes[node_idx+1];
+ 
+@@ -5123,6 +5137,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, {})) {
++        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
++        return 3;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+@@ -5149,6 +5168,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     }
+ 
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
++        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_GELU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+@@ -5278,12 +5298,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            const ggml_tensor * prev_mm_src1 = nullptr;
++            ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+ #ifdef USE_CUDA_GRAPH
+                 // fused nodes are skipped together, so a cut never splits a fusion
+                 // a concurrent region must join before its capture can end
+                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
++                    prev_mm_src1 = nullptr;
++                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
+                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                     chunk_end = i + chunk_size;
+@@ -5329,9 +5354,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (!is_concurrent_event_active && node->op == GGML_OP_MUL_MAT) {
++                    ggml_cuda_mmvq_set_q8_1_cache(node->src[1], node->src[1] == prev_mm_src1);
++                    prev_mm_src1 = node->src[1];
++                } else {
++                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
++                    prev_mm_src1 = nullptr;
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    prev_mm_src1 = nullptr;
++                    ggml_cuda_mmvq_set_q8_1_cache(nullptr, false);
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -5558,7 +5593,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 ggml_tensor * gate = glu->src[0];
+                 ggml_tensor * up   = glu->src[1];
+                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
+-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
++                if (ok && (ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device) ||
++                           ggml_cuda_should_fuse_mul_mat(up, gate, glu))) {
+                     add_alloc_deps(i, i + 2);
+                     i += 2;
+                     continue;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c6d895d..a6a0e6e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1156,7 +1156,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             GGML_TYPE_Q3_K,
+         };
+ 
+-        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
++        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA;
+         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+ 
+         if (is_nvidia_turing_plus) {
+@@ -1449,6 +1449,20 @@ static void mul_mat_vec_q_switch_type(
+     }
+ }
+ 
++static thread_local const ggml_tensor * g_mmvq_q8_1_src1        = nullptr;
++static thread_local bool                g_mmvq_q8_1_allow_reuse = false;
++static thread_local const char *        g_mmvq_q8_1_last_ptr    = nullptr;
++static thread_local size_t              g_mmvq_q8_1_last_size   = 0;
++
++void ggml_cuda_mmvq_set_q8_1_cache(const ggml_tensor * src1, bool allow_reuse) {
++    if (!allow_reuse || src1 != g_mmvq_q8_1_src1) {
++        g_mmvq_q8_1_last_ptr  = nullptr;
++        g_mmvq_q8_1_last_size = 0;
++    }
++    g_mmvq_q8_1_src1        = src1;
++    g_mmvq_q8_1_allow_reuse = allow_reuse;
++}
++
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -1546,12 +1560,20 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), q8_1_size);
++    if (g_mmvq_q8_1_allow_reuse && src1 == g_mmvq_q8_1_src1 &&
++        src1_q8_1.get() == g_mmvq_q8_1_last_ptr && q8_1_size == g_mmvq_q8_1_last_size) {
++        // Reuse already-quantized src1_q8_1 from immediately preceding MUL_MAT
++    } else {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+         quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (src1 == g_mmvq_q8_1_src1) {
++            g_mmvq_q8_1_last_ptr  = src1_q8_1.get();
++            g_mmvq_q8_1_last_size = q8_1_size;
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 5605bf7..af5296e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -8,6 +8,8 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+ // based on the quantization type and GPU architecture (compute capability).
+ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ 
++void ggml_cuda_mmvq_set_q8_1_cache(const ggml_tensor * src1, bool allow_reuse);
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index d6471bc..39ae013 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -134,7 +134,8 @@ static __global__ void rms_norm_f32(const T *     x,
+                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+-                                    const float   scale_out            = 1.0f) {
++                                    const float   scale_out            = 1.0f,
++                                    const float * scale_out_ptr        = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int nrows = gridDim.x;
+     const int row   = blockIdx.x;
+@@ -147,6 +148,8 @@ static __global__ void rms_norm_f32(const T *     x,
+ 
+     ggml_cuda_pdl_sync();
+ 
++    [[maybe_unused]] const float s_out = (do_add && scale_out_ptr) ? *scale_out_ptr : 1.0f;
++
+     // grid.y and grid.z are clamped to the CUDA limit, iterate over the excess channels/samples
+     for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+         for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+@@ -205,6 +208,12 @@ static __global__ void rms_norm_f32(const T *     x,
+                             r.y += a.y;
+                             r.z += a.z;
+                             r.w += a.w;
++                            if (scale_out_ptr) {
++                                r.x *= s_out;
++                                r.y *= s_out;
++                                r.z *= s_out;
++                                r.w *= s_out;
++                            }
+                         }
+                         if constexpr (do_scale) {
+                             r.x *= scale_out;
+@@ -234,7 +243,11 @@ static __global__ void rms_norm_f32(const T *     x,
+                     if constexpr (do_multiply && do_add) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+                         const int add_col = fastmodulo(col, add_ncols_packed);
+-                        dstc[col]         = ggml_cuda_cast<T>(scale * xi * mulc[mul_col] + ggml_cuda_cast<float>(addc[add_col]));
++                        float val         = scale * xi * mulc[mul_col] + ggml_cuda_cast<float>(addc[add_col]);
++                        if (scale_out_ptr) {
++                            val *= s_out;
++                        }
++                        dstc[col]         = ggml_cuda_cast<T>(val);
+                     } else if constexpr (do_multiply) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+                         dstc[col]         = ggml_cuda_cast<T>(scale * xi * mulc[mul_col]);
+@@ -417,7 +430,7 @@ static void group_norm_f32_cuda(
+             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+             add, add_stride_row, add_stride_channel, add_stride_sample, \
+-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
++            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, scale_out_ptr); \
+     } while (0)
+ 
+ template <bool do_multiply, bool do_add, bool do_scale, typename T_add = float, typename T>
+@@ -429,7 +442,7 @@ static void rms_norm_f32_dispatch(
+         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
+-        cudaStream_t   stream, const float scale_out = 1.0f) {
++        cudaStream_t   stream, const float scale_out = 1.0f, const float * scale_out_ptr = nullptr) {
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+ 
+@@ -514,7 +527,8 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
+-                                  cudaStream_t   stream) {
++                                  cudaStream_t   stream,
++                                  const float *  scale_out_ptr = nullptr) {
+     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+     if (mul_t == nullptr) {
+         rms_norm_f32_cuda(x_t, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+@@ -544,14 +558,14 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+                 mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 add_t, add_stride_row, add_stride_channel, add_stride_sample,
+-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream);
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream, 1.0f, scale_out_ptr);
+         } else {
+             rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/true, /*do_scale*/false, T>(
+                 blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+                 mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 add_t, add_stride_row, add_stride_channel, add_stride_sample,
+-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream);
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream, 1.0f, scale_out_ptr);
+         }
+     }
+ }
+@@ -745,7 +759,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-                                     ggml_tensor *               add_tensor) {
++                                     ggml_tensor *               add_tensor,
++                                     ggml_tensor *               scale_tensor) {
+     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+     float               eps          = 0.0f;
+ 
+@@ -771,6 +786,14 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+         GGML_ASSERT(false);
+     }
+ 
++    const float * scale_out_ptr = nullptr;
++    if (scale_tensor) {
++        const ggml_tensor * scale_src = (scale_tensor->src[0] == add_tensor) ? scale_tensor->src[1] : scale_tensor->src[0];
++        GGML_ASSERT(scale_tensor->src[0] == add_tensor || scale_tensor->src[1] == add_tensor);
++        GGML_ASSERT(scale_src->type == GGML_TYPE_F32 && ggml_nelements(scale_src) == 1);
++        scale_out_ptr = (const float *) scale_src->data;
++    }
++
+     cudaStream_t stream = ctx.stream();
+ 
+     GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32 || rms_norm_src->type == GGML_TYPE_BF16);
+@@ -814,7 +837,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+     const int add_nchannels = add_src->ne[2];
+     const int add_nsamples  = add_src->ne[3];
+ 
+-    rms_norm_launch_typed(add_tensor, [&](auto * dst_d) {
++    rms_norm_launch_typed(scale_tensor ? scale_tensor : add_tensor, [&](auto * dst_d) {
+         rms_norm_mul_f32_cuda(rms_norm_src, mul_src, add_src, dst_d,
+                               ne00, ne01, ne02, ne03,
+                               /*s00*/ s01, s02, s03,
+@@ -822,7 +845,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                               mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                               /*add_s00*/ add_s01, add_s02, add_s03,
+                               add_ncols, add_nrows, add_nchannels, add_nsamples,
+-                              eps, stream);
++                              eps, stream, scale_out_ptr);
+     });
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 95618df..ed6129f 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -13,7 +13,8 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-                                     ggml_tensor *               add_tensor);
++                                     ggml_tensor *               add_tensor,
++                                     ggml_tensor *               scale_tensor = nullptr);
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index b3b6aa4..f3413eb 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -750,6 +750,9 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+         case GGML_UNARY_OP_SILU:
+             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
+             break;
++        case GGML_UNARY_OP_GELU:
++            ggml_cuda_op_unary_mul_impl<op_gelu>(ctx, unary_node, mul_node);
++            break;
+         case GGML_UNARY_OP_SIGMOID:
+             ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
+             break;
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index d8cd441..e0e8f77 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1093,7 +1093,10 @@ static void llama_sampler_greedy_backend_apply(
+         ggml_set_name(curl, "greedy_sampled_token");
+     }
+ 
+-    data->sampled = curl;
++    data->sampled    = curl;
++    data->logits     = nullptr;
++    data->probs      = nullptr;
++    data->candidates = nullptr;
+ }
+ 
+ static struct llama_sampler_i llama_sampler_greedy_i = {
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 9c06131..e8763c9 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -243,6 +243,8 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+         // this is to mirror Gemma4Attention in pytorch code
+         ggml_tensor * qkv_fused = nullptr;
+         ggml_tensor * Qcur;
++        ggml_tensor * Kcur = nullptr;
++        ggml_tensor * Vcur = nullptr;
+         if (model.layers[il].wqkv) {
+             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+             cb(qkv_fused, "wqkv", il);
+@@ -250,6 +252,17 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+             Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_rows, qkv_fused->nb[1], 0));
+         } else {
+             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
++            if (hparams.has_kv(il)) {
++                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
++                Vcur = model.layers[il].wv
++                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
++                       : Kcur;
++                ggml_build_forward_expand(gf, Qcur);
++                ggml_build_forward_expand(gf, Kcur);
++                if (Vcur != Kcur) {
++                    ggml_build_forward_expand(gf, Vcur);
++                }
++            }
+         }
+         {
+             cb(Qcur, "Qcur", il);
+@@ -265,8 +278,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+ 
+         // self-attention
+         if (hparams.has_kv(il)) {
+-            ggml_tensor * Kcur;
+-            ggml_tensor * Vcur;
+             if (qkv_fused) {
+                 const int64_t q_dim = n_embd_head * n_head;
+                 const int64_t k_dim = n_embd_head * n_head_kv;
+@@ -274,11 +285,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+                 const size_t  esize = ggml_element_size(qkv_fused);
+                 Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
+                 Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
+-            } else {
+-                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+-                Vcur = model.layers[il].wv
+-                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+-                       : Kcur; // if v_proj is not present, use Kcur as Vcur
+             }
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
+@@ -402,7 +408,6 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+             cb(cur, "pe_in", il);
+ 
+             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_rows]
+-            cur = ggml_gelu(ctx0, cur);
+ 
+             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
+ 
+@@ -410,7 +415,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
+             }
+ 
+-            cur = ggml_mul(ctx0, cur, inp_this_layer);
++            cur = ggml_geglu_split(ctx0, cur, inp_this_layer);
+             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_rows]
+             cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
+             cb(cur, "per_layer_embd_out", il);

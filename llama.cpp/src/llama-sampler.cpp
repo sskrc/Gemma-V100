@@ -1093,7 +1093,10 @@ static void llama_sampler_greedy_backend_apply(
         ggml_set_name(curl, "greedy_sampled_token");
     }
 
-    data->sampled = curl;
+    data->sampled    = curl;
+    data->logits     = nullptr;
+    data->probs      = nullptr;
+    data->candidates = nullptr;
 }
 
 static struct llama_sampler_i llama_sampler_greedy_i = {

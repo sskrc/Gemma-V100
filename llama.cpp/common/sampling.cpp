@@ -345,6 +345,10 @@ struct common_sampler * common_sampler_init(
 
         bool use_adaptive_p = false; // see below
 
+        const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+            ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp <= 0.0f && params.dynatemp_range <= 0.0f) ||
+             (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
@@ -358,25 +362,37 @@ struct common_sampler * common_sampler_init(
                     }
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_K:
-                    samplers.push_back(llama_sampler_init_top_k(params.top_k));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_top_k(params.top_k));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_P:
-                    samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
-                    samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_MIN_P:
-                    samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_XTC:
                     samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
                     break;
                 case COMMON_SAMPLER_TYPE_TYPICAL_P:
-                    samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
-                    samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                    if (!greedy) {
+                        samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                    }
                     break;
                 case COMMON_SAMPLER_TYPE_INFILL:
                     samplers.push_back(llama_sampler_init_infill(vocab));
@@ -399,10 +415,6 @@ struct common_sampler * common_sampler_init(
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
-            // Keep distribution sampling when callers request probabilities.
-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
-                ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
-                 (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
             samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
@@ -616,10 +628,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
+    if (gsmpl->params.n_probs == 0) {
+        id = llama_get_sampled_token_ith(ctx, idx);
+
+        if (id != LLAMA_TOKEN_NULL) {
+            LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
+
+            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+
+            gsmpl->cur.assign(1, llama_token_data{ id, 0.0f, 1.0f });
+            gsmpl->cur_p = { gsmpl->cur.data(), 1, 0, true };
+
+            return id;
+        }
+    }
+
+    gsmpl->set_logits(ctx, idx);
+
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
