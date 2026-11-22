@@ -681,3 +681,35 @@ index 9c06131..e8763c9 100644
              cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_rows]
              cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
              cb(cur, "per_layer_embd_out", il);
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index 5b7d345..c9c1df1 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -2215,6 +2215,27 @@ void server_models_routes::init_routes() {
+                 model_info["context_length"] = meta.n_ctx_train;
+             }
+ 
++            // local patch: an unloaded model has no child to report "meta", so give the per-slot context the
++            // preset will load with, under the same keys a loaded child reports (llama-server's /v1/models
++            // "meta.n_ctx" / "meta.n_ctx_train"). A running child's own "meta" is merged below instead.
++            if (!meta.is_running()) {
++                std::string v;
++                long long n_ctx = 0, n_par = 1;
++                bool unified = false;
++                try {
++                    if (meta.preset.get_option("LLAMA_ARG_CTX_SIZE", v))   n_ctx   = std::stoll(v);
++                    if (meta.preset.get_option("LLAMA_ARG_N_PARALLEL", v)) n_par   = std::stoll(v);
++                    if (meta.preset.get_option("LLAMA_ARG_KV_UNIFIED", v)) unified = (v == "true" || v == "1" || v == "on");
++                } catch (const std::exception &) {
++                    n_ctx = 0;
++                }
++                if (n_ctx <= 0) n_ctx = meta.n_ctx_train;   // ctx-size 0 (or unset): the model's own
++                if (n_par <= 0) n_par = 1;
++                json m = {{"n_ctx_train", meta.n_ctx_train}};
++                if (n_ctx > 0) m["n_ctx"] = unified ? n_ctx : n_ctx / n_par;
++                model_info["meta"] = m;
++            }
++
+             if (models.sched->memory_enabled()) {
+                 model_info["memory"] = meta.memory.to_json();
+             }

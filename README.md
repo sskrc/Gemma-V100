@@ -26,3 +26,5 @@ curl http://HOST:8100/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Co
   -d '{"model":"gemma4-e4b","messages":[{"role":"user","content":"こんにちは"}],"max_tokens":100}'
 ```
 OpenAI 互換: `GET /v1/models`, `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`。`"stream":true` でストリーミング。
+- **モデル情報 (`GET /v1/models`)**: 各モデルに `meta.n_ctx`(1 スロットあたりの実効コンテキスト長)・`meta.n_ctx_train`・`architecture.input_modalities` が入ります。上流の router mode は読み込み中のモデルにしか `meta` を付けないため、未ロードのモデルでも preset の `ctx-size ÷ parallel` を同じキーで返すようにパッチしています(`tools/server/server-models.cpp`)。`context_length` は上流どおり `n_ctx_train` です。
+- **Thinking**: 既定でオン。`"reasoning_effort":"none"` か `"chat_template_kwargs":{"enable_thinking":false}` でオフ。low/medium/high などの段階は効きません(オン/オフのみ)。
